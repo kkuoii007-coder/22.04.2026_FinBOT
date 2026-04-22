@@ -1,178 +1,207 @@
 import asyncio
-import requests
-
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, FSInputFile
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import TOKEN
-
-
-MOEX_SEARCH_URL = "https://iss.moex.com/iss/securities.json"
-MAX_RESULTS_PER_GROUP = 15
+from config import TOKEN, API_rates
+import sqlite3
+import aiohttp
+import logging
+import requests
+import random
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-
-session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; MOEXIssuerBot/1.0)"})
+logging.basicConfig(level=logging.INFO)
 
 
-def fetch_securities(query: str) -> list[dict]:
-    params = {
-        "q": query,
-        "limit": 100,
-        "start": 0,
-        "iss.only": "securities",
-        "securities.columns": "secid,shortname,name,emitent_title,type,group,primary_boardid",
-        "lang": "ru",
-    }
+button_registr = KeyboardButton(text="Регистрация в боте")
+button_exchange_rates = KeyboardButton(text="Курс валют")
+button_tips = KeyboardButton(text="Советы по экономии")
+button_finances = KeyboardButton(text="Личные финансы")
 
-    try:
-        response = session.get(MOEX_SEARCH_URL, params=params, timeout=15)
-        response.raise_for_status()
-        payload = response.json()
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[[button_registr, button_exchange_rates], [button_tips, button_finances]],
+    resize_keyboard=True,
+)
 
-        block = payload.get("securities", {})
-        columns = block.get("columns", [])
-        data = block.get("data", [])
+conn = sqlite3.connect("users.db")
+cursor = conn.cursor()
 
-        if columns and data:
-            result = []
-            for row in data:
-                item = {str(col).lower(): value for col, value in zip(columns, row)}
-                result.append(item)
-            return result
-
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return [{str(k).lower(): v for k, v in row.items()} for row in data]
-
-        return []
-
-    except Exception as e:
-        print(f"Ошибка при запросе к MOEX API: {e}")
-        return []
-
-
-def filter_securities(securities: list[dict]) -> tuple[list[dict], list[dict]]:
-    stocks = []
-    bonds = []
-    seen_stocks = set()
-    seen_bonds = set()
-
-    for item in securities:
-        secid = item.get("secid")
-        if not secid:
-            continue
-
-        group = (item.get("group") or "").strip().lower()
-        shortname = item.get("shortname")
-        name = item.get("name")
-        emitent_title = item.get("emitent_title")
-        primary_boardid = item.get("primary_boardid")
-
-        display_name = shortname or name or emitent_title or secid
-
-        record = {
-            "code": secid,
-            "name": display_name,
-            "issuer": emitent_title,
-            "board": primary_boardid,
-        }
-
-        # Акции
-        if group == "stock_shares":
-            if secid not in seen_stocks:
-                seen_stocks.add(secid)
-                stocks.append(record)
-
-        # Облигации
-        elif group == "stock_bonds":
-            if secid not in seen_bonds:
-                seen_bonds.add(secid)
-                bonds.append(record)
-
-    return stocks[:MAX_RESULTS_PER_GROUP], bonds[:MAX_RESULTS_PER_GROUP]
-
-
-def format_response(query: str, stocks: list[dict], bonds: list[dict]) -> str:
-    if not stocks and not bonds:
-        return (
-            "Ничего не найдено.\n"
-            "Попробуйте ввести тикер или официальное краткое наименование эмитента/бумаги, "
-            "как на сайте Московской биржи.\n"
-            "Проверить наименование можно здесь:\n"
-            "https://www.moex.com/ru/spot/issues.aspx"
-        )
-
-    lines = [f"Найдено по запросу: {query}", ""]
-
-    if stocks:
-        lines.append("Акции:")
-        for stock in stocks:
-            lines.append(f"- {stock['code']} — {stock['name']}")
-    else:
-        lines.append("Акции не найдены.")
-
-    lines.append("")
-
-    if bonds:
-        lines.append("Облигации:")
-        for bond in bonds:
-            lines.append(f"- {bond['code']} — {bond['name']}")
-    else:
-        lines.append("Облигации не найдены.")
-
-    return "\n".join(lines)
-
-
-@dp.message(CommandStart())
-async def send_welcome(message: Message):
-    welcome_text = (
-        "Привет, я бот - агрегатор информации по ценным бумагам конкретных эмитентов.\n\n"
-        "Я ищу только акции и облигации.\n\n"
-        "Важно: имя эмитента лучше вводить в том виде, в котором оно используется на Московской бирже — "
-        "по тикеру, коду бумаги или официальному краткому наименованию.\n\n"
-        "Например:\n"
-        "Сбербанк → SBER\n\n"
-        "Если вы не уверены в названии, уточните его в официальном поиске Московской биржи:\n"
-        "https://www.moex.com/ru/spot/issues.aspx"
+cursor.execute(
+    """ 
+CREATE TABLE IF NOT EXISTS users (
+    id INEGER PRIMARY KEY,
+    telegram_id INTEDER UNIQUE,
+    name TEXT,
+    category1 TEXT,
+    category2 TEXT,
+    category3 TEXT,
+    expense1 REAL,
+    expense2 REAL,
+    expense3 REAL           
     )
-    await message.answer(welcome_text)
+"""
+)
+conn.commit()
 
 
-@dp.message(F.text)
-async def handle_text_message(message: Message):
-    user_query = message.text.strip()
+class FinancesForm(StatesGroup):
+    category1 = State()
+    expense1 = State()
+    category2 = State()
+    expense2 = State()
+    category3 = State()
+    expense3 = State()
 
-    # Игнорируем команды, кроме /start
-    if user_query.startswith("/"):
-        return
 
-    if len(user_query) < 3:
-        await message.answer(
-            "Пожалуйста, введите более точный запрос (не менее 3 символов)."
+@dp.message(Command("start"))
+async def start(message: Message):
+    await message.answer(
+        "Привет, я твой финансовый помошник. Выберите одну из опций в меню:",
+        reply_markup=keyboard,
+    )
+
+
+@dp.message(F.text == "Регистрация в боте")
+async def reg(message: Message):
+    telegram_id = message.from_user.id
+    name = message.from_user.full_name
+
+    cursor.execute(
+        """
+    SELECT * FROM users WHERE telegram_id = ?
+    """,
+        (telegram_id,),
+    )
+
+    user = cursor.fetchone()
+    if user:
+        await message.answer("Вы уже зарегистрированы!")
+    else:
+        cursor.execute(
+            """
+        INSERT INTO users (telegram_id, name) VALUES (?, ?)
+        """,
+            (telegram_id, name),
         )
-        return
+        conn.commit()
+        await message.answer("Вы успешно зарегистрированы!")
 
-    securities = await asyncio.to_thread(fetch_securities, user_query)
 
-    print(f"Запрос пользователя: {user_query}")
-    print(f"Всего строк от ISS: {len(securities)}")
-    if securities:
-        print("Первые 3 записи:")
-        for row in securities[:3]:
-            print(row)
+@dp.message(F.text == "Курс валют")
+async def exchange_rates(message: Message):
+    url = f"https://v6.exchangerate-api.com/v6/{API_rates}/latest/USD"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if response.status_code != 200:
+            await message.answer("Не удалось получить данные о курсе валют!")
+            return
+        usd_to_rub = data["conversion_rates"]["RUB"]
+        eur_to_usd = data["conversion_rates"]["EUR"]
 
-    stocks, bonds = filter_securities(securities)
-    response_text = format_response(user_query, stocks, bonds)
+        euro_to_rub = eur_to_usd * usd_to_rub
 
-    await message.answer(response_text)
+        await message.answer(
+            f"1 USD - {usd_to_rub:.2f}  RUB\n" f"\n1 EUR - {euro_to_rub:.2f}  RUB"
+        )
+
+    except:
+        await message.answer("Произошла ошибка")
+
+
+@dp.message(F.text == "Советы по экономии")
+async def send_tips(message: Message):
+    tips = [
+        "Совет 1: Ведите бюджет и следите за своими расходами.",
+        "Совет 2: Откладывайте часть доходов на сбережения.",
+        "Совет 3: Покупайте товары по скидкам и распродажам.",
+    ]
+    tip = random.choice(tips)
+    await message.answer(tip)
+
+
+@dp.message(F.text == "Личные финансы")
+async def finances(message: Message, state: FSMContext):
+    await state.set_state(FinancesForm.category1)
+    await message.reply("Введите первую категорию расходов:")
+
+
+@dp.message(FinancesForm.category1)
+async def finances(message: Message, state: FSMContext):
+    await state.update_data(category1=message.text)
+    await state.set_state(FinancesForm.expense1)
+    await message.reply("Введите расходы для категории 1:")
+
+
+@dp.message(FinancesForm.expense1)
+async def finances(message: Message, state: FSMContext):
+    await state.update_data(expense1=float(message.text))
+    await state.set_state(FinancesForm.category2)
+    await message.reply("Введите вторую категорию расходов:")
+
+
+@dp.message(FinancesForm.category2)
+async def finances(message: Message, state: FSMContext):
+    await state.update_data(category2=message.text)
+    await state.set_state(FinancesForm.expense2)
+    await message.reply("Введите расходы для категории 2:")
+
+
+@dp.message(FinancesForm.expense2)
+async def finances(message: Message, state: FSMContext):
+    await state.update_data(expense2=float(message.text))
+    await state.set_state(FinancesForm.category3)
+    await message.reply("Введите третью категорию расходов:")
+
+
+@dp.message(FinancesForm.category3)
+async def finances(message: Message, state: FSMContext):
+    await state.update_data(category3=message.text)
+    await state.set_state(FinancesForm.expense3)
+    await message.reply("Введите расходы для категории 3:")
+
+
+@dp.message(FinancesForm.expense3)
+async def finances(message: Message, state: FSMContext):
+    data = await state.get_data()
+    telegram_id = message.from_user.id
+    cursor.execute(
+        """UPDATE users SET 
+        category1 = ?, expense1 = ?, 
+        category2 = ?, expense2 = ?, 
+        category3 = ?, expense3 = ? 
+        WHERE telegram_id = ?""",
+        (
+            data["category1"],
+            data["expense1"],
+            data["category2"],
+            data["expense2"],
+            data["category3"],
+            float(message.text),
+            telegram_id,
+        ),
+    )
+    conn.commit()
+    await state.clear()
+
+    await message.answer("Категории и расходы сохранены!")
 
 
 async def main():
-    await dp.start_polling(bot, skip_updates=True)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
