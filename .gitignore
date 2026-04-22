@@ -1,0 +1,32 @@
+# Виртуальное окружение
+venv/
+env/
+.venv/
+
+# Папки и файлы Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.Python
+*.egg-info/
+.dist/
+*.egg
+
+# Логи
+*.log
+
+# Директории
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Временные файлы
+*~
